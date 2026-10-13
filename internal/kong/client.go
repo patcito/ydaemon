@@ -19,6 +19,11 @@ import (
 
 const (
 	DefaultTimeout = 30 * time.Second
+
+	// Kong's vaults query returns only the first 100 rows (ordered by TVL) when no limit is
+	// given, so every list query has to walk the pages with limit/offset.
+	KongVaultsPageSize = 1000
+	KongVaultsMaxPages = 50
 )
 
 type GraphQLRequest struct {
@@ -182,8 +187,8 @@ func (c *Client) executeQuery(ctx context.Context, query string, variables map[s
 
 func (c *Client) FetchVaultsForChain(ctx context.Context, chainID uint64) ([]KongVault, error) {
 	query := `
-		query FetchVaults($chainId: Int!) {
-			vaults(chainId: $chainId, yearn: true) {
+		query FetchVaults($chainId: Int!, $limit: Int!, $offset: Int!) {
+			vaults(chainId: $chainId, yearn: true, limit: $limit, offset: $offset) {
 				address
 				chainId
 				asset {
@@ -266,27 +271,52 @@ func (c *Client) FetchVaultsForChain(ctx context.Context, chainID uint64) ([]Kon
 		}
 	`
 
-	variables := map[string]interface{}{
+	vaults, err := c.fetchVaultPages(ctx, query, map[string]interface{}{
 		"chainId": int(chainID),
-	}
-
-	resp, err := c.executeQuery(ctx, query, variables)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch vaults for chain %d: %w", chainID, err)
 	}
 
-	var vaultsResp VaultsResponse
-	if err := json.Unmarshal(resp.Data, &vaultsResp); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal vaults response: %w", err)
+	return vaults, nil
+}
+
+// fetchVaultPages runs a Kong vaults query page by page until a short page comes back.
+// The query must accept $limit and $offset.
+func (c *Client) fetchVaultPages(ctx context.Context, query string, baseVariables map[string]interface{}) ([]KongVault, error) {
+	var vaults []KongVault
+	for page := 0; page < KongVaultsMaxPages; page++ {
+		variables := map[string]interface{}{
+			"limit":  KongVaultsPageSize,
+			"offset": page * KongVaultsPageSize,
+		}
+		for key, value := range baseVariables {
+			variables[key] = value
+		}
+
+		resp, err := c.executeQuery(ctx, query, variables)
+		if err != nil {
+			return nil, err
+		}
+
+		var vaultsResp VaultsResponse
+		if err := json.Unmarshal(resp.Data, &vaultsResp); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal vaults response: %w", err)
+		}
+
+		vaults = append(vaults, vaultsResp.Vaults...)
+		if len(vaultsResp.Vaults) < KongVaultsPageSize {
+			return vaults, nil
+		}
 	}
 
-	return vaultsResp.Vaults, nil
+	return nil, fmt.Errorf("kong vaults query did not end after %d pages", KongVaultsMaxPages)
 }
 
 func (c *Client) FetchAllVaults(ctx context.Context) (map[uint64][]KongVault, error) {
 	query := `
-		query FetchAllVaults {
-			vaults(yearn: true) {
+		query FetchAllVaults($limit: Int!, $offset: Int!) {
+			vaults(yearn: true, limit: $limit, offset: $offset) {
 				address
 				chainId
 				asset {
@@ -369,18 +399,13 @@ func (c *Client) FetchAllVaults(ctx context.Context) (map[uint64][]KongVault, er
 		}
 	`
 
-	resp, err := c.executeQuery(ctx, query, nil)
+	vaults, err := c.fetchVaultPages(ctx, query, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch all vaults: %w", err)
 	}
 
-	var vaultsResp VaultsResponse
-	if err := json.Unmarshal(resp.Data, &vaultsResp); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal vaults response: %w", err)
-	}
-
 	vaultsByChain := make(map[uint64][]KongVault)
-	for _, vault := range vaultsResp.Vaults {
+	for _, vault := range vaults {
 		chainID := uint64(vault.ChainID)
 		vaultsByChain[chainID] = append(vaultsByChain[chainID], vault)
 	}
